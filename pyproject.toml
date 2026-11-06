@@ -75,6 +75,7 @@ include = ["draft*"]
 # A robot is its parameter table, tree, and any mesh spec.
 "draft.robots" = ["**/*.yaml", "**/*.xml"]
 "draft.editor" = ["web/static/*"]
+"draft.explorer" = ["web/*"]
 "draft.tasks"  = ["*.yaml", "**/*.yaml"]
 
 [tool.pytest.ini_options]

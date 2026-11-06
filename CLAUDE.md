@@ -19,6 +19,7 @@ topic, and each package states its own claim at the top of its own README.
 | run or write code here | [`docs/contributing.md`](docs/contributing.md) |
 | fetch the vendor descriptions, or wonder why a twin skipped | [`docs/fetching-robots.md`](docs/fetching-robots.md) |
 | write a `tree.yaml` | [`docs/robot-format.md`](docs/robot-format.md) |
+| browse body plans beyond the humanoid and quadruped | [`src/draft/explorer/README.md`](src/draft/explorer/README.md) |
 | recreate a result from the paper | [`docs/reproducing.md`](docs/reproducing.md) |
 | redraw a figure from the paper | [`scripts/figures/README.md`](scripts/figures/README.md) |
 
@@ -63,7 +64,8 @@ topic, and each package states its own claim at the top of its own README.
 
 `generation/`, `trends/`, `robots/`, `twins/`, `tasks/quadruped/` and `lineup/`
 (the §V sweep) are the paper. `editor/` is not, but it is how a design is
-normally built.
+normally built. `explorer/` is not either: a zoomable map of body plans to
+browse before committing to one, which exports to an ordinary robot directory.
 
 Nothing else is here. The paper's humanoid appears as a generation example and
 as a twin target, never as a policy.

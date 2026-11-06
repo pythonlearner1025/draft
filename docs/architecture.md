@@ -11,6 +11,7 @@
 | `src/draft/tasks/` | The quadruped RL tasks. See [`tasks.md`](tasks.md). |
 | `src/draft/lineup/` | The paper's training and evaluation sweep, driven by `scripts/train_all.py`. See [`reproducing.md`](reproducing.md). |
 | `src/draft/editor/` | The browser editor behind `scripts/robot_tuner.py`. |
+| `src/draft/explorer/` | The morphology atlas behind `scripts/morphology_explorer.py`: a zoomable map of body plans, each exportable as a robot directory. See its [README](../src/draft/explorer/README.md). |
 | `datasets/` | The actuator catalogue and robot-description survey, with the numbered stages that fit the trends. |
 | `experiments/` | Design variants, the sweep specification and the frozen results. |
 | `scripts/` | Command-line entry points; `scripts/figures/` has one script per paper figure. |

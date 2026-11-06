@@ -4,6 +4,7 @@
 |---|---|
 | [`architecture.md`](architecture.md) | What is where, and the generation pipeline in order. Start here. |
 | [`robot-format.md`](robot-format.md) | Writing a robot: `parameters.yaml`, `tree.yaml`, `mesh.yaml`. |
+| [`../src/draft/explorer/README.md`](../src/draft/explorer/README.md) | The morphology atlas: browsing body plans before writing one. |
 | [`fitted-trends.md`](fitted-trends.md) | What the trends derive, what you may state, and what refuses a design. |
 | [`provenance.md`](provenance.md) | Where each number in a generated robot comes from. |
 | [`actuator-dataset.md`](actuator-dataset.md) | The 114-actuator catalogue and its fits. |
