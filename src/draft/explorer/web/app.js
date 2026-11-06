@@ -5,7 +5,7 @@
 // the new tiles are the designs *between* the ones you were looking at.
 
 import { World, decode, describe, sliceDirections, sliceLatent, hashString } from './genome.js';
-import { Thumbnailer, DetailViewer } from './render.js';
+import { Thumbnailer, DetailViewer, renderingTier } from './render.js';
 import { toDraft, installCommand, zipBytes } from './draft_export.js';
 
 const $ = (id) => document.getElementById(id);
@@ -48,7 +48,9 @@ let world = new World(state.seed);
 // ── designs and thumbnails, cached by canonical grid point ───────────────────
 
 class LRU {
-  constructor(limit, weigh = () => 1) { this.limit = limit; this.weigh = weigh; this.map = new Map(); this.total = 0; }
+  constructor(limit, weigh = () => 1, evict = () => {}) {
+    this.limit = limit; this.weigh = weigh; this.evict = evict; this.map = new Map(); this.total = 0;
+  }
   get(k) {
     const v = this.map.get(k);
     if (v !== undefined) { this.map.delete(k); this.map.set(k, v); }
@@ -56,21 +58,39 @@ class LRU {
   }
   set(k, v) {
     const old = this.map.get(k);
-    if (old !== undefined) { this.total -= this.weigh(old); this.map.delete(k); }
+    if (old !== undefined) { this.total -= this.weigh(old); this.map.delete(k); if (old !== v) this.evict(old); }
     this.map.set(k, v);
     this.total += this.weigh(v);
     while (this.total > this.limit && this.map.size > 1) {
       const [fk, fv] = this.map.entries().next().value;
       this.map.delete(fk);
       this.total -= this.weigh(fv);
+      this.evict(fv);
     }
   }
-  clear() { this.map.clear(); this.total = 0; }
+  clear() { for (const v of this.map.values()) this.evict(v); this.map.clear(); this.total = 0; }
 }
 
-const designs = new LRU(5000);
-const thumbs = new LRU(150e6, (t) => t.px * t.px * 4);
-const TIERS = [96, 160, 256, 384];
+// The map keeps a small summary per tile (a full design tree is ~100x larger)
+// and decodes the whole design again only to draw or open it: that takes
+// a fraction of a millisecond.
+const summaries = new LRU(6000);
+const full = new LRU(48);
+// Thumbnails are GPU-side bitmaps, closed the moment they leave the cache.
+const thumbs = new LRU(96e6, (t) => t.px * t.px * 4, (t) => t.bmp.close());
+const pending = new Set();
+
+// One thumbnail resolution, big enough for the largest a tile gets on this
+// screen, so zooming never re-renders a tile at another size.
+// Where WebGL is rasterised on the CPU, every pixel costs: draw less of them.
+const LIGHT = renderingTier() === 'software';
+// Device pixels per CSS pixel for the map. A software renderer pays for every
+// pixel, so there the map is painted at 1x and scaled up by the browser.
+const mapDpr = () => (LIGHT ? 1 : Math.min(2, window.devicePixelRatio || 1));
+const thumbSize = () => {
+  const dpr = mapDpr();
+  return Math.max(128, Math.min(LIGHT ? 192 : 320, Math.ceil((target() * 1.2 * dpr) / 32) * 32));
+};
 
 const namespace = () => (state.mode === 'world' ? `w${state.seed}` : `a${state.epoch}`);
 
@@ -85,21 +105,35 @@ function latentAt(u, v) {
     : sliceLatent(state.around.center, state.around.dirs, u, v);
 }
 
+/** What the map needs to draw a tile, without the design's body tree. */
 function designAt(i, j, L) {
   const key = pointKey(i, j, L);
-  let d = designs.get(key);
+  let d = summaries.get(key);
   if (!d) {
     const step = 2 ** -L;
-    d = decode(latentAt(i * step, j * step));
-    d.key = key;
-    d.where = { u: i * step, v: j * step, ns: namespace() };
-    designs.set(key, d);
+    const z = latentAt(i * step, j * step);
+    const dec = decode(z);
+    d = { key, z, id: dec.id, dof: dec.dof, plan: planKey(dec),
+          where: { u: i * step, v: j * step, ns: namespace() } };
+    summaries.set(key, d);
+  }
+  return d;
+}
+
+/** The whole design behind a tile summary. */
+function fullDesign(summary) {
+  let d = full.get(summary.key);
+  if (!d) {
+    d = decode(summary.z);
+    d.key = summary.key;
+    d.where = summary.where;
+    full.set(summary.key, d);
   }
   return d;
 }
 
 let thumbnailer = null;
-try { thumbnailer = new Thumbnailer(384); } catch (e) { console.warn('no WebGL', e); }
+try { thumbnailer = new Thumbnailer(thumbSize(), { light: LIGHT }); } catch (e) { console.warn('no WebGL', e); }
 
 // ── colour ───────────────────────────────────────────────────────────────────
 
@@ -160,6 +194,7 @@ function zoomAt(x, y, factor) {
   state.view.s = Math.max(min, Math.min(max, s));
   state.view.cx = u - (x - canvas.clientWidth / 2) / state.view.s;
   state.view.cy = v - (y - canvas.clientHeight / 2) / state.view.s;
+  lastMove = performance.now();
   invalidate();
 }
 
@@ -181,28 +216,53 @@ function schedule() {
   requestAnimationFrame(frame);
 }
 
-function frame() {
+// How many thumbnails to render per frame. Most of a thumbnail's cost lands on
+// the GPU, where a JavaScript timer cannot see it, so the budget follows the
+// frame interval the browser actually delivers.
+let perFrame = 2;
+let lastFrame = 0;
+// While the map is moving, motion comes first: thumbnails wait (on a software
+// renderer) or trickle in one a frame, and catch up as soon as it stops.
+let lastMove = 0;
+let lastThumb = 0;
+const IDLE_MS = 180;
+
+function frame(now) {
   scheduled = false;
-  const t0 = performance.now();
-  if (dirty) { dirty = false; draw(); }
-  // Render thumbnails nearest the middle first, a few milliseconds a frame.
-  let rendered = 0;
-  while (queue.length && thumbnailer && (rendered === 0 || performance.now() - t0 < 10)) {
-    const job = queue.shift();
-    const have = thumbs.get(job.d.key);
-    if (have && have.px >= job.px) continue;
-    const c = thumbnailer.render(job.d, job.px, tokens.dark ? 0.45 : 0.22);
-    thumbs.set(job.d.key, { canvas: c, px: job.px, born: have ? have.born : performance.now() });
-    rendered++;
+  if (lastFrame) {
+    const dt = now - lastFrame;
+    if (dt > 28) perFrame = Math.max(1, perFrame - 1);
+    else if (dt < 20) perFrame = Math.min(LIGHT ? 2 : 6, perFrame + 1);
   }
-  if (rendered) dirty = true;
+  lastFrame = now;
+  if (dirty) { dirty = false; draw(); }
+  // Thumbnails nearest the middle of the screen first.
+  const moving = now - lastMove < IDLE_MS;
+  const budget = !moving ? perFrame : !LIGHT ? 1 : now - lastThumb > 250 ? 1 : 0;
+  let started = 0;
+  while (queue.length && thumbnailer && started < budget) {
+    const job = queue.shift();
+    if (thumbs.get(job.d.key) || pending.has(job.d.key)) continue;
+    pending.add(job.d.key);
+    started++;
+    lastThumb = now;
+    const key = job.d.key;
+    const px = thumbnailer.size;
+    thumbnailer.render(fullDesign(job.d), tokens.dark ? 0.45 : 0.22).then((bmp) => {
+      pending.delete(key);
+      thumbs.set(key, { bmp, px, born: performance.now() });
+      invalidate();
+    }, () => pending.delete(key));
+  }
   if (dirty || queue.length || fading) schedule();
+  else lastFrame = 0;
+  if (moving && queue.length) setTimeout(schedule, IDLE_MS);
 }
 
 let fading = false;
 
 function resizeCanvas() {
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const dpr = mapDpr();
   const w = canvas.clientWidth, h = canvas.clientHeight;
   if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
     canvas.width = Math.round(w * dpr);
@@ -225,7 +285,6 @@ function draw() {
   const [u1, v1] = toWorld(W, H);
   const i0 = Math.floor(u0 / step) - 1, i1 = Math.ceil(u1 / step) + 1;
   const j0 = Math.floor(v0 / step) - 1, j1 = Math.ceil(v1 / step) + 1;
-  const need = TIERS.find((t) => t >= tile * dpr * 0.94) ?? TIERS[TIERS.length - 1];
   const now = performance.now();
   const pinned = new Set(state.pins.map((p) => p.id));
   const counts = new Map();
@@ -239,7 +298,7 @@ function draw() {
       const d = designAt(i, j, L);
       const [sx, sy] = toScreen(i * step, j * step);
       const x = sx - tile / 2, y = sy - tile / 2;
-      const pk = planKey(d);
+      const pk = d.plan;
       if (sx > -tile / 2 && sx < W + tile / 2 && sy > -tile / 2 && sy < H + tile / 2) {
         counts.set(pk, (counts.get(pk) || 0) + 1);
       }
@@ -254,7 +313,7 @@ function draw() {
         if (age < 1) fading = true;
         g2d.globalAlpha = age;
         const inset = tile * 0.04;
-        g2d.drawImage(th.canvas, x + inset, y + inset, tile - 2 * inset, tile - 2 * inset);
+        g2d.drawImage(th.bmp, x + inset, y + inset, tile - 2 * inset, tile - 2 * inset);
         g2d.globalAlpha = 1;
       } else {
         g2d.fillStyle = tokens.muted;
@@ -264,9 +323,9 @@ function draw() {
         g2d.fill();
         g2d.globalAlpha = 1;
       }
-      if (!th || th.px < need) {
+      if (!th && !pending.has(d.key)) {
         const dist = Math.hypot(sx - W / 2, sy - H / 2);
-        if (sx > -tile && sx < W + tile && sy > -tile && sy < H + tile) jobs.push({ d, px: need, dist });
+        if (sx > -tile && sx < W + tile && sy > -tile && sy < H + tile) jobs.push({ d, dist });
       }
 
       if (tile >= 150) {
@@ -309,6 +368,9 @@ function draw() {
   }
   jobs.sort((a, b) => a.dist - b.dist);
   queue = jobs;
+  // Keep at least two screens of thumbnails, so a big display cannot thrash the cache.
+  const px = thumbnailer ? thumbnailer.size : 0;
+  thumbs.limit = Math.max(96e6, 2 * (i1 - i0 + 1) * (j1 - j0 + 1) * px * px * 4);
   updateLegend(counts);
   const z = state.view.s / state.homeScale;
   $('zoom-readout').textContent = `×${z >= 10 ? z.toFixed(0) : z >= 1 ? z.toFixed(1) : z.toPrecision(2)}`;
@@ -377,6 +439,7 @@ canvas.addEventListener('pointermove', (e) => {
     if (gesture.moved > 4) { canvas.classList.add('dragging'); hideHint(); }
     state.view.cx -= dx / state.view.s;
     state.view.cy -= dy / state.view.s;
+    lastMove = performance.now();
     invalidate();
   } else if (gesture?.kind === 'pinch' && pointers.size === 2) {
     const [a, b] = [...pointers.values()];
@@ -396,7 +459,7 @@ function endPointer(e) {
   if (gesture?.kind === 'pan' && pointers.size === 0 && gesture.moved < 6
       && e.timeStamp - gesture.t < 600) {
     const t = tileAt(gesture.sx, gesture.sy);
-    if (t) select(designAt(t.i, t.j, t.L));
+    if (t) select(fullDesign(designAt(t.i, t.j, t.L)));
   }
   if (pointers.size === 0) gesture = null;
   else if (pointers.size === 1) {
@@ -434,7 +497,7 @@ canvas.addEventListener('keydown', (e) => {
   else if (e.key === '-' || e.key === '_') zoomAt(W / 2, H / 2, 1 / 1.5);
   else if (e.key === 'Enter') {
     const t = tileAt(W / 2, H / 2);
-    if (t) select(designAt(t.i, t.j, t.L));
+    if (t) select(fullDesign(designAt(t.i, t.j, t.L)));
   } else return;
   e.preventDefault();
   invalidate();
@@ -562,7 +625,7 @@ function openSheet(d) {
   renderFileTabs('tree.yaml');
 
   if (!viewer && thumbnailer) {
-    try { viewer = new DetailViewer($('viewer')); } catch (e) { console.warn(e); }
+    try { viewer = new DetailViewer($('viewer'), { light: LIGHT }); } catch (e) { console.warn(e); }
   }
   if (viewer) {
     viewer.setAnimate($('animate').checked);
@@ -604,8 +667,13 @@ function renderTray() {
     const d = decode(Float64Array.from(p.z));
     d.key = `pin:${p.id}`;
     if (thumbnailer) {
-      const c = thumbnailer.render(d, 104, tokens.dark ? 0.45 : 0.22);
+      const c = document.createElement('canvas');
+      c.width = c.height = 104;
       b.append(c);
+      thumbnailer.render(d, tokens.dark ? 0.45 : 0.22).then((bmp) => {
+        c.getContext('2d').drawImage(bmp, 0, 0, 104, 104);
+        bmp.close();
+      });
     }
     b.addEventListener('click', () => { state.selected = d; openSheet(d); invalidate(); });
     return b;
@@ -719,8 +787,16 @@ home();
 if (store.get('hintSeen', false)) $('hint').hidden = true;
 updateModeUI();
 renderTray();
-new ResizeObserver(() => invalidate()).observe(canvas);
-const onTheme = () => { readTokens(); legendSig = ''; invalidate(); };
+new ResizeObserver(() => {
+  // A new screen size or density can need another thumbnail resolution.
+  if (thumbnailer && thumbSize() !== thumbnailer.size) {
+    thumbnailer.resize(thumbSize());
+    thumbs.clear();
+  }
+  invalidate();
+}).observe(canvas);
+// The contact shadow is drawn into each thumbnail, darker on a dark map.
+const onTheme = () => { readTokens(); legendSig = ''; thumbs.clear(); invalidate(); };
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', onTheme);
 new MutationObserver(onTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 invalidate();

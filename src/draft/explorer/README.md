@@ -100,13 +100,33 @@ it.
 - **Not every mechanism.** Joints are hinges. There are no prismatic joints, no
   closed chains and no springs, because the format has none.
 
+## Drawing
+
+The map is a 2D canvas of tiles. Each robot is drawn once, into a GPU-side
+`ImageBitmap` that the map reuses until it leaves a cache sized to about two
+screens of tiles, and is then closed:
+
+- **Instanced drawing.** A robot is a few instanced meshes, one per primitive
+  and material, posed straight from forward kinematics. That is about ten draw
+  calls however many parts it has, and the detail view swings its joints the
+  same way.
+- **Cheap summaries.** Tiles keep only a summary (id, DoF, body plan, latent
+  vector). The full body tree is decoded again when a tile is drawn or opened.
+- **Pacing by frame time.** How many robots are drawn per frame follows the
+  frame interval the browser actually delivers, not a JavaScript timer, because
+  most of the cost is on the GPU where a timer cannot see it. While the map is
+  moving, motion comes first and thumbnails catch up when it stops.
+- **Light mode.** Where WebGL runs on the CPU (SwiftShader, llvmpipe), the map
+  paints at 1×, thumbnails are smaller and diffuse-only, and the detail view
+  has no shadows.
+
 ## Files
 
 | file | job |
 |---|---|
 | `web/genome.js` | genes, world fields, slices, `decode`, forward kinematics |
 | `web/draft_export.js` | design → `parameters.yaml`, `tree.yaml`, `mesh.yaml`; install command; zip |
-| `web/render.js` | three.js thumbnails and the orbit view |
+| `web/render.js` | instanced three.js drawing: thumbnails and the orbit view |
 | `web/app.js`, `web/index.html` | the map, the sheet, pins |
 | `server.py` | serves `web/`; `/api/save` and `/api/check` for the local page |
 
