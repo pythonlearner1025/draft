@@ -118,10 +118,40 @@ export const GENES = [
   ['scale', 'S'], ['hub_round', 'S'], ['hub_aspect', 'S'], ['hub_height', 'S'],
   ['chain_len', 'S'], ['torque', 'S'], ['gear', 'S'],
   ...[0, 1, 2].flatMap((k) => GROUP_GENES.map(([n, b]) => [`g${k}_${n}`, b])),
+  // Appended, so the genes above keep their world fields and offsets.
+  ['hub_upright', 'P'],
 ].map(([name, band], i) => ({ name, band, index: i }));
 
 export const D = GENES.length;
-const GENE_INDEX = Object.fromEntries(GENES.map((g) => [g.name, g.index]));
+export const GENE_INDEX = Object.fromEntries(GENES.map((g) => [g.name, g.index]));
+
+/** Share of hub designs whose body stands upright (a torso rather than a slab). */
+const UPRIGHT_ABOVE = 0.85;
+
+/**
+ * The body plan alone, from the four slowest genes: what tints the map, and
+ * what "Go to" searches for without decoding whole designs. `zOf(name)` gives
+ * a gene's latent (standard-normal) value.
+ */
+export function planFrom(zOf) {
+  const g = (name) => Phi(zOf(name));
+  const plan = g('plan') < 0.8 ? 'hub' : 'chain';
+  const sym = plan === 'chain' ? 'bilateral'
+    : pickWeighted(g('symmetry'), [['radial', 0.42], ['bilateral', 0.42], ['asymmetric', 0.16]]);
+  const n = 3 + Math.min(5, Math.floor(g('radial_n') * 6));
+  const upright = plan === 'hub' && g('hub_upright') > UPRIGHT_ABOVE;
+  const key = plan === 'chain' ? 'chain' : sym === 'radial' ? `radial-${n}`
+    : sym === 'bilateral' && upright ? 'upright' : sym;
+  return { plan, sym, n, upright, key };
+}
+
+export const PLAN_GENES = ['plan', 'symmetry', 'radial_n', 'hub_upright'];
+
+/** Every body plan the map tints, in the order a reader would look for them. */
+export const PLANS = [
+  ['bilateral', 'Bilateral'], ['upright', 'Upright'], ['asymmetric', 'Asymmetric'], ['chain', 'Chain'],
+  ...[3, 4, 5, 6, 7, 8].map((k) => [`radial-${k}`, `Radial ×${k}`]),
+];
 
 // ── 2-D simplex noise, for the world map ─────────────────────────────────────
 
@@ -199,6 +229,14 @@ export class World {
     this.offsets = GENES.map(() => [rand() * 4000 - 2000, rand() * 4000 - 2000]);
   }
 
+  /** One gene's latent value at (u, v). */
+  geneAt(u, v, name) {
+    const g = GENES[GENE_INDEX[name]];
+    const { freq, octaves } = BANDS[g.band];
+    const [ox, oy] = this.offsets[g.index];
+    return fbm(this.noise, u * freq, v * freq, ox, oy, octaves) / FBM_SD[octaves];
+  }
+
   latentAt(u, v) {
     const z = new Float64Array(D);
     for (const g of GENES) {
@@ -229,6 +267,12 @@ export function sliceDirections(seed) {
 }
 
 /** A point on the plane through `center` spanned by `dirs`; one unit moves each gene about half a standard deviation. */
+/** One gene's latent value on such a plane, for the map's search. */
+export function sliceGene(center, dirs, u, v, name) {
+  const i = GENE_INDEX[name];
+  return (Number.isFinite(center[i]) ? center[i] : 0) + 0.5 * Math.sqrt(D) * (u * dirs.a[i] + v * dirs.b[i]);
+}
+
 export function sliceLatent(center, dirs, u, v) {
   const k = 0.5 * Math.sqrt(D);
   const z = new Float64Array(D);
@@ -298,19 +342,24 @@ const PROFILES = {
   lens: [[-1, 0.4], [-0.55, 0.86], [0, 1], [0.55, 0.86], [1, 0.4]],
   wedge: [[-1, 1], [1, 0.62]],
   keel: [[-1, 0.3], [-0.45, 0.8], [0.2, 1], [1, 1]],
+  // An upright torso: narrow at the waist, broad at the shoulders.
+  torso: [[-1, 0.72], [-0.4, 0.66], [0.35, 0.95], [0.78, 1], [1, 0.8]],
 };
 
-function makeHub(g, S, sym, n) {
-  const profileName = pickWeighted(g('hub_profile'),
-    [['slab', 0.3], ['dome', 0.22], ['lens', 0.18], ['wedge', 0.15], ['keel', 0.15]]);
+function makeHub(g, S, sym, n, upright) {
+  const profileName = upright
+    ? pickWeighted(g('hub_profile'), [['torso', 0.4], ['slab', 0.25], ['lens', 0.2], ['keel', 0.15]])
+    : pickWeighted(g('hub_profile'),
+      [['slab', 0.3], ['dome', 0.22], ['lens', 0.18], ['wedge', 0.15], ['keel', 0.15]]);
   const profile = PROFILES[profileName];
-  const hh = 0.5 * S * lerp(0.16, 0.42, g('hub_height'));
+  // A flat body is far wider than tall; an upright one is a torso, taller than wide.
+  const hh = 0.5 * S * (upright ? lerp(0.75, 1.5, g('hub_height')) : lerp(0.16, 0.42, g('hub_height')));
   let rho;
   let shape;
   if (sym === 'radial') {
     // A rounded n-gon with flat faces centred on the limb directions, so the
     // hub keeps the body plan's rotational symmetry.
-    const A = 0.5 * S * lerp(0.62, 1.05, g('hub_aspect'));
+    const A = 0.5 * S * (upright ? lerp(0.38, 0.6, g('hub_aspect')) : lerp(0.62, 1.05, g('hub_aspect')));
     const q = lerp(0.15, 1, g('hub_round'));
     rho = (th) => {
       const step = TAU / n;
@@ -319,8 +368,9 @@ function makeHub(g, S, sym, n) {
     };
     shape = `${n}-sided`;
   } else {
-    const a = 0.5 * S * lerp(0.85, 1.55, g('hub_aspect'));
-    const b = 0.5 * S * lerp(0.72, 0.5, g('hub_aspect'));
+    // Upright: shallow front to back and broad side to side, like a chest.
+    const a = 0.5 * S * (upright ? lerp(0.32, 0.5, g('hub_aspect')) : lerp(0.85, 1.55, g('hub_aspect')));
+    const b = 0.5 * S * (upright ? lerp(0.55, 0.85, g('hub_aspect')) : lerp(0.72, 0.5, g('hub_aspect')));
     const p = logLerp(2, 7, g('hub_round'));
     rho = (th) => Math.pow(Math.pow(Math.abs(Math.cos(th) / a), p)
       + Math.pow(Math.abs(Math.sin(th) / b), p), -1 / p);
@@ -384,7 +434,7 @@ function makeHub(g, S, sym, n) {
     return Math.hypot(p[0], p[1]) <= rho(th) * scaleAt(clamp(p[2], -hh, hh)) + pad;
   };
   return { profile: profileName, shape, hh, outline, layers, rho, point, clearPoint, normal,
-           sideAngle, scaleAt, inside, volume, top: hh, bottom: -hh };
+           sideAngle, scaleAt, inside, volume, top: hh, bottom: -hh, upright };
 }
 
 function polygonArea(pts) {
@@ -678,7 +728,10 @@ function attachEffector(ctx, spec, label, node, L, alpha, effCls, drawNextDrum) 
 // ── placements on the hub ────────────────────────────────────────────────────
 
 function sidePlacement(hub, th, zf, phiOffset, el) {
-  const z = zf * hub.hh * 0.75;
+  return sideAt(hub, th, zf * hub.hh * 0.75, phiOffset, el);
+}
+
+function sideAt(hub, th, z, phiOffset, el) {
   const n = hub.normal(th);
   return { pos: hub.point(th, z), surface: (hz) => hub.clearPoint(th, z, hz), normal: n,
            phi: Math.atan2(n[1], n[0]) + phiOffset, el };
@@ -710,8 +763,39 @@ function hubPlacements(ctx, hub, sym, n, spec) {
     return { kind, out };
   }
   if (sym === 'bilateral') {
-    const kind = k === 0 ? 'pairs' : pickWeighted(spec.place,
-      [['pairs', 0.35], ['front', 0.2], ['rear', 0.15], ['top', 0.25], ['bottom', 0.05]]);
+    const kind = k === 0
+      ? pickWeighted(spec.place, hub.upright ? [['hips', 0.75], ['pairs', 0.25]] : [['pairs', 0.8], ['hips', 0.2]])
+      : pickWeighted(spec.place, hub.upright
+        ? [['shoulders', 0.5], ['top', 0.25], ['pairs', 0.15], ['front', 0.05], ['rear', 0.05]]
+        : [['pairs', 0.35], ['front', 0.2], ['rear', 0.15], ['top', 0.25], ['bottom', 0.05]]);
+    if (kind === 'hips') {
+      // Legs hanging from under the body. An upright torso gets one pair
+      // (a biped); a flat body one or two (a table on legs).
+      const P = hub.upright ? 1 : pickWeighted(spec.count, [[1, 0.4], [2, 0.6]]);
+      const e = ctx.classes.L;
+      const yMin = 1.15 * Math.max(e.r, e.len / 2) + 0.004;
+      const y = Math.max(yMin, hub.point(Math.PI / 2, hub.bottom)[1] * lerp(0.35, 0.7, spec.spread));
+      const ax = hub.point(0, hub.bottom)[0];
+      // Knees bend one way or the other, set by the group's sweep.
+      const phi = spec.sweep >= 0 ? 0 : Math.PI;
+      for (let p = 0; p < P; p++) {
+        const x = P === 1 ? ax * lerp(-0.15, 0.15, spec.phase) : (p === 0 ? 1 : -1) * ax * lerp(0.45, 0.75, spec.spread);
+        for (const side of [1, -1]) {
+          out.push({ pos: [x, side * y, hub.bottom], normal: [0, 0, -1], phi, el: -Math.PI / 2 });
+        }
+      }
+      return { kind, out };
+    }
+    if (kind === 'shoulders') {
+      // A pair high on the sides of a torso, hanging down or reaching out.
+      const z = hub.hh * lerp(0.45, 0.8, (spec.height / 0.7 + 1) / 2);
+      const x = hub.point(0, z)[0] * lerp(-0.15, 0.15, spec.spread);
+      const el = lerp(-85, -10, (spec.elev / DEG + 80) / 135) * DEG;
+      const th = hub.sideAngle(x, z);
+      out.push(sideAt(hub, th, z, spec.sweep * 0.3, el));
+      out.push(sideAt(hub, -th, z, -spec.sweep * 0.3, el));
+      return { kind, out };
+    }
     if (kind === 'pairs') {
       const P = k === 0 ? pickWeighted(spec.count, [[1, 0.3], [2, 0.45], [3, 0.25]])
         : pickWeighted(spec.count, [[1, 0.65], [2, 0.35]]);
@@ -865,11 +949,11 @@ function buildChain(ctx, hub, root, g) {
 
 /** Turn a latent vector into a design: a body tree plus what a reader needs to know about it. */
 export function decode(z) {
-  const g = (name) => Phi(z[GENE_INDEX[name]]);
-  const plan = g('plan') < 0.8 ? 'hub' : 'chain';
-  const sym = plan === 'chain' ? 'bilateral'
-    : pickWeighted(g('symmetry'), [['radial', 0.42], ['bilateral', 0.42], ['asymmetric', 0.16]]);
-  const n = 3 + Math.min(5, Math.floor(g('radial_n') * 6));
+  // A gene missing from an older latent vector sits at its median.
+  const zOf = (name) => (Number.isFinite(z[GENE_INDEX[name]]) ? z[GENE_INDEX[name]] : 0);
+  const g = (name) => Phi(zOf(name));
+  const body = planFrom(zOf);
+  const { plan, sym, n, upright } = body;
   const S = logLerp(0.22, 1.1, g('scale'));
   const gear = Math.round(logLerp(6, 50, g('gear')));
   const tauL = 30 * Math.pow(S / 0.5, 2.4) * lerp(0.6, 1.6, g('torque'));
@@ -878,7 +962,7 @@ export function decode(z) {
     const tau = Math.max(1.0, tauL * f);
     classes[c] = { tau, gear, ...actuatorEnvelope(tau, gear) };
   }
-  const hub = makeHub(g, S, sym, n);
+  const hub = makeHub(g, S, sym, n, upright);
   const ctx = { S, classes, limbs: 0, wheels: 0, effectors: {}, modules: 0 };
   const root = { name: 'hub', role: 'hub', pos: [0, 0, 0], rot: I3, joint: null,
                  geoms: [{ k: 'hub' }], children: [] };
@@ -899,13 +983,21 @@ export function decode(z) {
     for (let k = 0; k < nGroups; k++) {
       const spec = groupSpec(g, k, S);
       const { kind, out } = hubPlacements(ctx, hub, sym, n, spec);
+      if (kind === 'hips' && ['gripper', 'pad'].includes(spec.eff)) spec.eff = 'foot';
+      // On an upright torso, legs and arms are sized to the torso rather than
+      // to the body's overall scale, the same length gene read on that range.
+      if (hub.upright && (kind === 'hips' || kind === 'shoulders')) {
+        const t = Math.log(spec.length / (0.45 * S)) / Math.log(1.7 / 0.45);
+        spec.length = 2 * hub.hh * (kind === 'hips' ? lerp(0.8, 1.4, t) : lerp(0.5, 1.0, t));
+      }
       const labels = out.map((_, j) => `g${k}${String.fromCharCode(97 + j)}`);
       root.children.push(...buildGroup(ctx, hub, spec, labels, out));
       groups.push({ spec, kind, count: out.length });
     }
   }
 
-  const design = { z: Array.from(z), plan, sym, n, S, gear, classes, hub, root, groups, chain };
+  const design = { z: Array.from(z), plan, sym, n, upright, planKey: body.key, S, gear, classes, hub,
+                   root, groups, chain };
   finish(design, ctx);
   return design;
 }
@@ -1010,6 +1102,9 @@ function finish(design, ctx) {
 function familyOf(d) {
   if (d.plan === 'chain') return { key: `chain-${d.chain.nmod + 1}`, label: `Chain ×${d.chain.nmod + 1}` };
   if (d.sym === 'radial') return { key: `radial-${d.n}`, label: `Radial ×${d.n}` };
+  if (d.sym === 'bilateral' && d.upright) {
+    return { key: `upright-${d.limbs}`, label: `Upright · ${d.limbs} limb${d.limbs === 1 ? '' : 's'}` };
+  }
   if (d.sym === 'bilateral') {
     const limbs = d.limbs;
     return { key: `bilateral-${limbs}`, label: `Bilateral · ${limbs} limb${limbs === 1 ? '' : 's'}` };
@@ -1022,7 +1117,9 @@ export function describe(d) {
   const lines = [];
   const m = (x) => `${(x * 100).toFixed(0)} cm`;
   const hubDims = `${m(2 * d.hub.point(0, 0)[0])} × ${m(2 * d.hub.point(Math.PI / 2, 0)[1])} × ${m(2 * d.hub.hh)}`;
-  lines.push({ label: 'Body', text: `${d.hub.profile} ${d.hub.shape} hub, ${hubDims}` });
+  lines.push({ label: 'Body', text: d.upright
+    ? `upright ${d.hub.profile === 'torso' ? '' : `${d.hub.profile} `}torso, ${hubDims}`
+    : `${d.hub.profile} ${d.hub.shape} hub, ${hubDims}` });
   if (d.chain) {
     const how = { none: 'no appendages', legs: 'a leg pair per module', wheels: 'a wheel pair per module',
                   mixed: 'legs and wheels alternating' }[d.chain.app];
@@ -1035,6 +1132,7 @@ export function describe(d) {
     const axes = spec.pattern.slice(0, spec.nseg).map((a, i) =>
       (spec.eff === 'wheel' && i === spec.nseg - 1 ? 'pitch' : axisWord[a]));
     const where = { faces: 'around the hub', vertices: 'between them', top: 'on top', bottom: 'underneath',
+                    hips: 'under the body', shoulders: 'at the shoulders',
                     pairs: 'in side pairs', front: 'at the front', rear: 'at the rear',
                     scattered: 'off-axis' }[kind] || kind;
     lines.push({

@@ -13,7 +13,7 @@ python scripts/morphology_explorer.py    # http://127.0.0.1:8082
 
 Every tile is one design, drawn in Draft's own palette with its actuators at the
 size Draft's fitted airgap and slenderness relations give their class. Tiles
-are tinted by body plan (radial ×n, bilateral, asymmetric, chain), so
+are tinted by body plan (radial ×n, bilateral, upright, asymmetric, chain), so
 territories show up as regions when you zoom out.
 
 - **Zoom is semantic.** Tiles stay about the same size on screen. Zooming in
@@ -24,16 +24,19 @@ territories show up as regions when you zoom out.
   latent space centred on that design, along two random directions. Its
   neighbours are its mutations, and zoom sets the mutation size. **Turn the
   slice** picks two new directions.
+- **Go to a body plan** jumps to the nearest region of that plan. It reads
+  only the four genes that set the plan, so it searches thousands of points in
+  a few milliseconds.
 - **Pin** keeps a shortlist in your browser.
 
 ## How the space is built (`web/genome.js`)
 
-A design is a latent vector `z` of 73 standard-normal genes. `decode(z)` builds
+A design is a latent vector `z` of 74 standard-normal genes. `decode(z)` builds
 the body tree.
 
 | band | changes | genes |
 |---|---|---|
-| P | slowest | body plan (hub or chain), symmetry, radial order |
+| P | slowest | body plan (hub or chain), symmetry, radial order, upright torso |
 | T | slow | limb groups, segment count, effector, joint-axis pattern, placement |
 | S | medium | scale, hub shape, elevation, sweep, limb length, rest bend |
 | F | fast | segment proportions, taper, effector size |
@@ -48,7 +51,12 @@ A decoded design is a hub (a loft of stacked outlines, as `mesh.yaml` writes
 it) with up to three limb groups:
 
 - **Placements:** radial on faces, vertices, top or bottom; bilateral in side
-  pairs, front, rear or top; asymmetric anywhere.
+  pairs, under the body (hips), front, rear or top; asymmetric anywhere.
+- **Upright torsos:** about one hub in eight stands upright, taller than it is
+  wide. Its legs usually hang from the hips and its arms from the shoulders,
+  both sized to the torso. A bilateral upright body is its own plan on the map
+  (about 5% of it); about one design in 75 has two legs under the hips and two
+  arms at the shoulders.
 - **Chains:** a head followed by modules, each with legs, wheels or nothing.
 - **Limbs:** one to four hinge segments ending in a ball foot, flat foot,
   wheel, gripper, peg or pad.

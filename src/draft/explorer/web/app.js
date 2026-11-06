@@ -4,7 +4,8 @@
 // the same size on screen, so zooming in halves the spacing in latent space and
 // the new tiles are the designs *between* the ones you were looking at.
 
-import { World, decode, describe, sliceDirections, sliceLatent, hashString } from './genome.js';
+import { World, decode, describe, sliceDirections, sliceLatent, sliceGene, hashString, planFrom,
+         PLANS } from './genome.js';
 import { Thumbnailer, DetailViewer, renderingTier } from './render.js';
 import { toDraft, installCommand, zipBytes } from './draft_export.js';
 
@@ -41,7 +42,9 @@ const state = {
   savedWorld: null,
   selected: null,
   hover: null,
-  pins: store.get('pins', []),
+  // Ids are recomputed, so a pin saved before a gene was added keeps a name
+  // that matches what it decodes to now.
+  pins: store.get('pins', []).map((p) => ({ ...p, id: decode(Float64Array.from(p.z)).id })),
 };
 let world = new World(state.seed);
 
@@ -113,7 +116,7 @@ function designAt(i, j, L) {
     const step = 2 ** -L;
     const z = latentAt(i * step, j * step);
     const dec = decode(z);
-    d = { key, z, id: dec.id, dof: dec.dof, plan: planKey(dec),
+    d = { key, z, id: dec.id, dof: dec.dof, plan: dec.planKey,
           where: { u: i * step, v: j * step, ns: namespace() } };
     summaries.set(key, d);
   }
@@ -151,11 +154,10 @@ function readTokens() {
 }
 
 // One hue per body plan, so territories read as regions when you zoom out.
-const HUES = { bilateral: 32, asymmetric: 338, chain: 78, 'radial-3': 206, 'radial-4': 186,
+const HUES = { bilateral: 32, upright: 118, asymmetric: 338, chain: 78, 'radial-3': 206, 'radial-4': 186,
                'radial-5': 166, 'radial-6': 226, 'radial-7': 248, 'radial-8': 268 };
-const planKey = (d) => (d.plan === 'chain' ? 'chain' : d.sym === 'radial' ? `radial-${d.n}` : d.sym);
-const planLabel = (k) => (k.startsWith('radial') ? `Radial ×${k.split('-')[1]}`
-  : { bilateral: 'Bilateral', asymmetric: 'Asymmetric', chain: 'Chain' }[k]);
+const PLAN_LABEL = Object.fromEntries(PLANS);
+const planLabel = (k) => PLAN_LABEL[k] ?? k;
 const tint = (k) => (tokens.dark ? `hsl(${HUES[k]} 22% 18%)` : `hsl(${HUES[k]} 40% 89%)`);
 const swatch = (k) => (tokens.dark ? `hsl(${HUES[k]} 32% 40%)` : `hsl(${HUES[k]} 44% 72%)`);
 
@@ -562,6 +564,81 @@ $('btn-reseed').addEventListener('click', () => {
   closeSheet();
   updateModeUI();
   invalidate();
+});
+
+// ── go to a body plan ────────────────────────────────────────────────────────
+
+/** The body plan at a point, from its four slowest genes only: no full decode. */
+function planKeyAt(u, v) {
+  const zOf = state.mode === 'world' ? (name) => world.geneAt(u, v, name)
+    : (name) => sliceGene(state.around.center, state.around.dirs, u, v, name);
+  return planFrom(zOf).key;
+}
+
+/**
+ * The nearest point with this body plan, searched in widening square rings
+ * around the middle of the screen. Body plans change slowly across the map,
+ * so a coarse ring finds a region and a fine pass finds a tile in it.
+ */
+function findNearest(key) {
+  const { cx, cy } = state.view;
+  const step = state.mode === 'world' ? 2 : 0.25;
+  const rings = state.mode === 'world' ? 400 : 160;
+  for (let r = 0; r <= rings; r++) {
+    let best = null;
+    const test = (i, j) => {
+      const u = cx + i * step, v = cy + j * step;
+      if (planKeyAt(u, v) !== key) return;
+      const dist = Math.hypot(i, j);
+      if (!best || dist < best.dist) best = { u, v, dist };
+    };
+    for (let i = -r; i <= r; i++) { test(i, -r); if (r) test(i, r); }
+    for (let j = -r + 1; j <= r - 1; j++) { test(-r, j); test(r, j); }
+    if (best) return best;
+  }
+  return null;
+}
+
+function goTo(key) {
+  const hit = findNearest(key);
+  const status = $('goto-status');
+  if (!hit) {
+    status.textContent = state.mode === 'world'
+      ? `No ${planLabel(key)} designs within reach. Try a new world.`
+      : `This slice has no ${planLabel(key)} designs nearby. Turn the slice or go back to the world map.`;
+    return;
+  }
+  // Land on a tile of that plan at the current zoom.
+  const L = level();
+  const s = 2 ** -L;
+  let land = [Math.round(hit.u / s) * s, Math.round(hit.v / s) * s];
+  outer: for (let r = 0; r <= 4; r++) {
+    for (let i = -r; i <= r; i++) {
+      for (let j = -r; j <= r; j++) {
+        if (Math.max(Math.abs(i), Math.abs(j)) !== r) continue;
+        const u = land[0] + i * s, v = land[1] + j * s;
+        if (designAt(Math.round(u / s), Math.round(v / s), L).plan === key) { land = [u, v]; break outer; }
+      }
+    }
+  }
+  const tiles = Math.round(Math.hypot(land[0] - state.view.cx, land[1] - state.view.cy) / s);
+  state.view.cx = land[0];
+  state.view.cy = land[1];
+  status.textContent = tiles === 0 ? `${planLabel(key)} is right here.` : `${planLabel(key)}: ${tiles} tiles away.`;
+  hideHint();
+  invalidate();
+}
+
+$('goto').append(...PLANS.map(([key, label]) => {
+  const o = document.createElement('option');
+  o.value = key;
+  o.textContent = label;
+  return o;
+}));
+$('goto').addEventListener('change', (e) => {
+  const key = e.target.value;
+  e.target.value = '';
+  if (key) goTo(key);
 });
 
 // ── the sheet ────────────────────────────────────────────────────────────────
